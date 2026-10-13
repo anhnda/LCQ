@@ -226,12 +226,14 @@ def make_problem(cfg: ToyConfig) -> ToyProblem:
     A = (sig.unsqueeze(1) * Vt) * scales.unsqueeze(0)
 
     # KNOB 3: E = G diag(E_eig) G^T, indefinite, ||E||_2 = eps_norm.
-    if cfg.eps_norm > 0.0 and cfg.eps_rank > 0:
-        G = _random_orthonormal(M, cfg.eps_rank, g)           # (M, eps_rank)
-        mag = torch.linspace(1.0, 0.3, cfg.eps_rank, device=DEVICE, dtype=DTYPE)
-        n_neg = int(round(cfg.eps_neg_frac * cfg.eps_rank))
-        sign = torch.ones(cfg.eps_rank, device=DEVICE, dtype=DTYPE)
-        perm = torch.randperm(cfg.eps_rank, device=DEVICE, generator=g)
+    # eps_rank cannot exceed M (can't have more orthonormal cols than rows).
+    eff_eps_rank = min(cfg.eps_rank, M)
+    if cfg.eps_norm > 0.0 and eff_eps_rank > 0:
+        G = _random_orthonormal(M, eff_eps_rank, g)           # (M, eff_eps_rank)
+        mag = torch.linspace(1.0, 0.3, eff_eps_rank, device=DEVICE, dtype=DTYPE)
+        n_neg = int(round(cfg.eps_neg_frac * eff_eps_rank))
+        sign = torch.ones(eff_eps_rank, device=DEVICE, dtype=DTYPE)
+        perm = torch.randperm(eff_eps_rank, device=DEVICE, generator=g)
         sign[perm[:n_neg]] = -1.0
         E_eig = sign * mag
         E_eig = E_eig / E_eig.abs().max() * cfg.eps_norm       # ||E||_2 == eps_norm
@@ -261,32 +263,48 @@ def _single_move_loss(prob: ToyProblem, i: int, v: float = 1.0) -> Tensor:
 
 def _plant_cooperative_pairs(prob: ToyProblem, g: torch.Generator) -> list[tuple[int, int]]:
     """Create pairs (i,j) in DIFFERENT layers with dL_i>0, dL_j>0 but dL_ij<0.
-    Mechanism: give i and j opposite loadings on one shared low-rank direction
-    so (A^T A)_ij = a_i . a_j < 0 (strong negative cross), while c keeps each
-    single move costly. Verified by assertion-style checks the caller can run."""
+
+    IMPORTANT subtlety learned the hard way: within the PSD part A^T A,
+    Cauchy-Schwarz forces |M_ij| <= sqrt(M_ii M_jj), and the shared loading that
+    makes M_ij negative ALSO inflates M_ii, M_jj -- AM-GM then kills the joint
+    benefit. So you cannot plant a cooperative pair by magnitude alone.
+
+    Robust construction = c-CANCELLATION: set the shared cross term M_ij < 0,
+    then set c_i, c_j so that L_i = L_j = eps (small, positive). Then
+        L_ij = c_i + c_j + 1/2(M_ii + M_jj) + M_ij = 2*eps + M_ij
+    EXACTLY, independent of the diagonal. Pick M_ij < -2*eps and the pair is
+    provably cooperative. This is why cooperative pairs are really a property of
+    the (indefinite) interaction, not of raw curvature magnitude."""
     cfg = prob.cfg
     L = cfg.n_layers
+    lam = cfg.coupling_lambda
     pairs: list[tuple[int, int]] = []
-    if cfg.r_true < 1:
+    if cfg.r_true < 1 or lam <= 0.0:
         return pairs
-    dir_k = 0  # reuse the top (highest-energy) direction -> easy to detect if needed
+    eps = 0.05                       # each single move left mildly bad: L_i = eps
+    row = 0                          # dedicated shared low-rank direction
     for _ in range(cfg.n_cooperative_pairs):
         la, lb = torch.randperm(L, device=DEVICE, generator=g)[:2].tolist()
         i = la * cfg.cand_per_layer + int(torch.randint(cfg.cand_per_layer, (1,),
                                           device=DEVICE, generator=g))
         j = lb * cfg.cand_per_layer + int(torch.randint(cfg.cand_per_layer, (1,),
                                           device=DEVICE, generator=g))
-        mag = 1.5 * cfg.sigma_scale
-        prob.A[dir_k, i] = +mag * prob.scales[i]
-        prob.A[dir_k, j] = -mag * prob.scales[j]       # opposite sign => negative cross
-        # make each single move individually unattractive (positive dL).
-        li = _single_move_loss(prob, i).item()
-        lj = _single_move_loss(prob, j).item()
-        if li < 0:
-            prob.c[i] += (-li + 0.05)
-        if lj < 0:
-            prob.c[j] += (-lj + 0.05)
-        pairs.append((i, j))
+        # isolate i,j so their cross curvature is one controlled shared direction
+        prob.A[:, i] = 0.0
+        prob.A[:, j] = 0.0
+        v = math.sqrt(0.6 / lam)                    # aim |lam v^2| ~ 0.6
+        for _try in range(6):
+            prob.A[row, i] = v
+            prob.A[row, j] = -v                     # opposite sign -> negative cross
+            Mij = prob.full_curv_offdiag(i, j).item()
+            if 2 * eps + Mij < -0.2:                # safely cooperative
+                break
+            v *= 1.5
+        Mii = prob.full_curv_offdiag(i, i).item()
+        Mjj = prob.full_curv_offdiag(j, j).item()
+        prob.c[i] = eps - 0.5 * Mii                 # => L_i = eps  > 0
+        prob.c[j] = eps - 0.5 * Mjj                 # => L_j = eps  > 0
+        pairs.append((i, j))                        # => L_ij = 2*eps + Mij < 0
     return pairs
 
 
@@ -302,10 +320,14 @@ def _plant_low_energy_decider(prob: ToyProblem, g: torch.Generator) -> None:
     # pick a handful of coords spread across layers.
     n = min(4, cfg.n_layers)
     coords = [l * cfg.cand_per_layer + (l % cfg.cand_per_layer) for l in range(n)]
+    # reference the SMALL end of the spectrum, but load it strongly enough on a
+    # handful of coords that truncating below low_dir flips their joint ranking
+    # while barely moving E(r). (Illustrative: the global-spearman metric is
+    # dominated by big directions, so this shows up most in top-K among ties.)
     small = prob.A[low_dir].abs().mean().clamp(min=1e-6)
     pattern = torch.tensor([+1.0, -1.0, +1.0, -1.0][:n], device=DEVICE, dtype=DTYPE)
     for idx, coord in enumerate(coords):
-        prob.A[low_dir, coord] += 0.8 * small * pattern[idx] * prob.scales[coord]
+        prob.A[low_dir, coord] += 3.0 * small * pattern[idx] * prob.scales[coord]
 
 
 # ----------------------------------------------------------------------------
