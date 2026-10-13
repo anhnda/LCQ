@@ -319,7 +319,11 @@ def fisher_half_apply(prob: L1Problem, J: Tensor) -> Tensor:
         evals, evecs = torch.linalg.eigh(F)
         Fhalf = evecs @ torch.diag(evals.clamp(min=0).sqrt()) @ evecs.T
         R[x * d:(x + 1) * d] = Fhalf @ Jr[x]
-    return R                                            # (N*d, M)
+    # CRITICAL: the loss is a MEAN over N samples, so its GN metric is (1/N) F_x
+    # per sample. Without this, H_GN = R^T R is a SUM and comes out N times too
+    # large -- which swamps the (correctly-normalized) linear term c and makes
+    # both the surrogate ranking and the parallel solver meaningless.
+    return R / math.sqrt(N)                             # (N*d, M)
 
 
 def exact_gn(prob: L1Problem) -> tuple[Tensor, Tensor]:
@@ -351,7 +355,10 @@ def sketch_gn(prob: L1Problem, r: int) -> tuple[Tensor, SolveCost]:
             F = torch.diag(px) - px.outer(px)
             ev, U = torch.linalg.eigh(F)
             Fhalfs.append(U @ torch.diag(ev.clamp(min=0).sqrt()) @ U.T)
-        Fhalf = torch.stack(Fhalfs)                    # (N, d, d)
+        # fold the 1/sqrt(N) mean-normalization into F^{1/2} so the sketch
+        # estimates the SAME normalized H_GN as exact_gn (used once in Rt_apply
+        # => F^{1/2}/sqrt(N); twice in the core => F/N).
+        Fhalf = torch.stack(Fhalfs) / math.sqrt(N)     # (N, d, d)
 
     gph = torch.Generator(device=DEVICE); gph.manual_seed(1234 + r)
 
