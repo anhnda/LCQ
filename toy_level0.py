@@ -862,6 +862,13 @@ if __name__ == "__main__":
     _pretty(run_once(cfg_C))
 
     # --- tiny instance to compare against the brute-force optimum ---
+    # NOTE: keep cooperative pairs LOW here. On 15 coords, 6 coop pairs saturate
+    # the instance so that EVERY single move is individually bad -> greedy /
+    # coordinate solvers stall at 0 (they cannot make simultaneous cross-layer
+    # moves), while only exhaustive finds the cooperative optimum. That is a real
+    # optimization obstacle, but it makes this instance useless for checking
+    # solver *correctness* against exhaustive. 1 pair keeps singles meaningful.
     cfg_tiny = ToyConfig(n_layers=3, cand_per_layer=5, budget_K=4, r_true=4,
-                         eps_norm=0.3, n_eval_proposals=800, seed=1)
+                         eps_norm=0.3, n_cooperative_pairs=1,
+                         n_eval_proposals=800, seed=1)
     _pretty(run_once(cfg_tiny, ranks=[1, 2, 3, 4]))
